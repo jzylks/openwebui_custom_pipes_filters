@@ -1,5 +1,5 @@
 """
-title: AddMetadata
+title: AddMetadata_LiteLLM
 author: thiswillbeyourightub
 author_url: https://github.com/thiswillbeyourgithub/openwebui_custom_pipes_filters/
 funding_url: https://github.com/thiswillbeyourgithub/openwebui_custom_pipes_filters/
@@ -13,6 +13,10 @@ from pydantic import BaseModel, Field
 from typing import Optional, Callable, Any
 import json
 from functools import cache
+from fastapi import Request
+import aiohttp
+from open_webui.env import AIOHTTP_CLIENT_TIMEOUT
+
 
 @cache
 def load_json_dict(user_value: str) -> dict:
@@ -23,6 +27,7 @@ def load_json_dict(user_value: str) -> dict:
     assert isinstance(loaded, dict), f"json is not a dict but '{type(loaded)}'"
     return loaded
 
+
 @cache
 def load_json_list(user_value: str) -> list:
     user_value = user_value.strip()
@@ -30,7 +35,9 @@ def load_json_list(user_value: str) -> list:
         return []
     loaded = json.loads(user_value)
     assert isinstance(loaded, list), f"json is not a list but '{type(loaded)}'"
-    assert all(isinstance(elem, str) for elem in loaded), f"List contained non strings elements: '{loaded}'"
+    assert all(
+        isinstance(elem, str) for elem in loaded
+    ), f"List contained non strings elements: '{loaded}'"
     return loaded
 
 
@@ -52,8 +59,17 @@ class Filter:
             default='["open-webui"]',
             description="String that when passed through json.loads is a list that will be added as tags to the request.",
         )
+        add_litellm_enduser: bool = Field(
+            default=False,
+            description="Create new end user in LiteLLM for spend tracking",
+        )
+        litellm_enduser_key: str = Field(
+            default="",
+            description="Key with permissions to create end users in LiteLLM",
+        )
         debug: bool = Field(
-            default=False, description="True to add emitter prints",
+            default=False,
+            description="True to add emitter prints",
         )
 
     def __init__(self):
@@ -68,29 +84,32 @@ class Filter:
         body: dict,
         __user__: Optional[dict] = None,
         __event_emitter__: Callable[[dict], Any] = None,
-        ) -> dict:
+        __request__: Request = None,
+    ) -> dict:
         # printer
         emitter = EventEmitter(__event_emitter__)
+
         async def log(message: str):
             if self.valves.debug:
-                print(f"AddMetadata filter: inlet: {message}")
+                print(f"AddMetadata_LiteLLM filter: inlet: {message}")
             if self.valves.debug:
                 await emitter.progress_update(message)
             else:
                 await emitter.progress_update("")
 
-
         if self.valves.debug:
-            await log(f"AddMetadata filter: inlet: __user__ {__user__}")
-            await log(f"AddMetadata filter: inlet: body {body}")
+            await log(f"AddMetadata_LiteLLM filter: inlet: __user__ {__user__}")
+            await log(f"AddMetadata_LiteLLM filter: inlet: body {body}")
 
         # user
         if self.valves.add_userinfo:
             if "user" in body:
                 await log(f"User key already found in body: '{body['user']}'")
                 if body["user"] != __user__["name"]:
-                    await log(f"User key different than expected: '{body['user']}' vs '{__user__['name']}'")
-            new_value = f"{__user__['name']}_{__user__['email']}"
+                    await log(
+                        f"User key different than expected: '{body['user']}' vs '{__user__['name']}'"
+                    )
+            new_value = f"{__user__['name']}"
             body["user"] = new_value
             await log(f"Added user metadata '{new_value}'")
 
@@ -99,13 +118,54 @@ class Filter:
             else:
                 body["metadata"] = {"open-webui_userinfo": __user__}
 
+            if self.valves.add_litellm_enduser:
+                url = __request__.app.state.config.OPENAI_API_BASE_URLS[0]
+                # key = __request__.app.state.config.OPENAI_API_KEYS[0]
+                key = self.valves.litellm_enduser_key
+
+                payload = json.dumps({"user_id": body["user"]})
+                try:
+                    session = aiohttp.ClientSession(
+                        trust_env=True,
+                        timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT),
+                    )
+
+                    r = await session.request(
+                        method="POST",
+                        url=f"{url}/end_user/new",
+                        data=payload,
+                        headers={
+                            "Authorization": f"Bearer {key}",
+                            "Content-Type": "application/json",
+                        },
+                    )
+
+                    await log(
+                        {"user": body["user"], "url": url, "response_status": r.status}
+                    )
+
+                    # Check if response is SSE
+                    try:
+                        response = await r.json()
+                    except Exception as e:
+                        await log(e)
+                except Exception as e:
+                    await log(e)
+                finally:
+                    if session:
+                        if r:
+                            r.close()
+                        await session.close()
+
         # metadata
         metadata = load_json_dict(self.valves.extra_metadata)
         if metadata:
             if "metadata" in body:
                 for k, v in metadata.items():
                     if k in body["metadata"]:
-                        if isinstance(v, list) and isinstance(body["metadata"][k], list):
+                        if isinstance(v, list) and isinstance(
+                            body["metadata"][k], list
+                        ):
                             body["metadata"][k].extend(v)
                         elif isinstance(body["metadata"][k], list):
                             body["metadata"][k].append(v)
@@ -168,4 +228,3 @@ class EventEmitter:
                     },
                 }
             )
-
